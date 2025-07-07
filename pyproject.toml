@@ -18,6 +18,7 @@ dependencies = [
     "opencv-python>=4.9.0",
     "pandas>=2.1.0",
     "rich>=13.7.0",
+    "nibabel>=5.3.2",
 ]
 
 [build-system]
@@ -36,3 +37,8 @@ target-version = "py312"
 python_version = "3.12"
 warn_return_any = true
 warn_unused_configs = true
+
+[dependency-groups]
+dev = [
+    "pytest>=8.4.1",
+]
