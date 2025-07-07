@@ -146,7 +146,13 @@ def correct_beam_hardening(image: sitk.Image, correction_strength: float = 0.5) 
     # Only correct positive HU values (water to bone range)
     mask = (array > water_hu) & (array < bone_hu)
     
+    # Initialize voxels_corrected
+    voxels_corrected = 0
+    
     if np.any(mask):
+        # Count voxels to be corrected
+        voxels_corrected = int(np.sum(mask))
+        
         # Normalize to [0, 1] range
         norm_values = (array[mask] - water_hu) / (bone_hu - water_hu)
         
@@ -164,7 +170,7 @@ def correct_beam_hardening(image: sitk.Image, correction_strength: float = 0.5) 
     info = {
         "method": "Polynomial Beam Hardening Correction",
         "correction_strength": correction_strength,
-        "voxels_corrected": int(np.sum(mask))
+        "voxels_corrected": voxels_corrected
     }
     
     return corrected_image, info
@@ -276,24 +282,34 @@ def apply_artifact_correction(
     corrected = image
     info = {"corrections_applied": []}
     
-    if correct_metal:
-        console.print("\n[bold]Checking for metal artifacts...[/bold]")
-        corrected, metal_info = reduce_metal_artifacts_simple(corrected)
-        if metal_info.get("method", "none") != "none":
-            info["corrections_applied"].append("metal")
-            info["metal_correction"] = metal_info
+    try:
+        if correct_metal:
+            console.print("\n[bold]Checking for metal artifacts...[/bold]")
+            corrected, metal_info = reduce_metal_artifacts_simple(corrected)
+            if metal_info.get("method", "none") != "none":
+                info["corrections_applied"].append("metal")
+                info["metal_correction"] = metal_info
+    except Exception as e:
+        console.print(f"[red]Metal artifact correction failed: {type(e).__name__}: {str(e)}[/red]")
+        raise
     
     if correct_beam_hardening:
         console.print("\n[bold]Applying beam hardening correction...[/bold]")
-        corrected, bh_info = correct_beam_hardening(corrected)
+        # Use globals() to get the actual function, not the parameter
+        beam_hardening_func = globals()['correct_beam_hardening']
+        corrected, bh_info = beam_hardening_func(corrected)
         info["corrections_applied"].append("beam_hardening")
         info["beam_hardening_correction"] = bh_info
     
-    if correct_rings:
-        console.print("\n[bold]Checking for ring artifacts...[/bold]")
-        corrected, ring_info = remove_ring_artifacts(corrected)
-        info["corrections_applied"].append("rings")
-        info["ring_correction"] = ring_info
+    try:
+        if correct_rings:
+            console.print("\n[bold]Checking for ring artifacts...[/bold]")
+            corrected, ring_info = remove_ring_artifacts(corrected)
+            info["corrections_applied"].append("rings")
+            info["ring_correction"] = ring_info
+    except Exception as e:
+        console.print(f"[red]Ring artifact correction failed: {type(e).__name__}: {str(e)}[/red]")
+        raise
     
     return corrected, info
 

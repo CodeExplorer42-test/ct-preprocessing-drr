@@ -17,6 +17,7 @@ from denoising import denoise_adaptive
 from super_resolution import harmonize_slice_thickness
 from artifact_correction import apply_artifact_correction
 from hu_calibration import phantom_free_calibration, hu_to_attenuation_coefficient, print_calibration_report
+from polyenergetic_conversion import export_polyenergetic_data
 from quality_control import generate_qc_report
 
 console = Console()
@@ -50,7 +51,7 @@ class CTPreprocessor:
             },
             "denoising": {
                 "enabled": True,
-                "method": "nlm",  # "gaussian", "bilateral", "nlm"
+                "method": "auto",  # "auto", "gaussian", "bilateral", "nlm", "curvature"
                 "adaptive": True
             },
             "super_resolution": {
@@ -65,7 +66,8 @@ class CTPreprocessor:
             },
             "calibration": {
                 "enabled": True,
-                "energy_kev": 70.0
+                "use_polyenergetic": True,  # Use physics-accurate polyenergetic model
+                "energy_kev": None  # None = full spectrum, or specify single energy
             },
             "quality_control": {
                 "enabled": True,
@@ -130,6 +132,12 @@ class CTPreprocessor:
                     sitk.sitkBSpline
                 )
                 
+                # Use Lanczos for best quality when dealing with thick slices
+                original_spacing = image.GetSpacing()
+                if original_spacing[2] / original_spacing[0] > 2.0:
+                    console.print("[yellow]Using Lanczos interpolation for thick slice handling[/yellow]")
+                    interpolator = sitk.sitkLanczosWindowedSinc
+                
                 resampled, resample_info = resample_to_isotropic(
                     current_image,
                     target_spacing=self.config["resampling"]["target_spacing"],
@@ -157,18 +165,16 @@ class CTPreprocessor:
             start_time = time.time()
             
             try:
-                # Check if SR is needed based on ORIGINAL spacing
+                # Always apply SR to enhance z-axis detail from original thick slices
                 original_spacing = image.GetSpacing()
-                if original_spacing[2] / original_spacing[0] > 2.0:
-                    console.print(f"[yellow]Original Z-spacing ({original_spacing[2]:.2f}mm) is {original_spacing[2]/original_spacing[0]:.1f}x larger than XY-spacing[/yellow]")
-                    harmonized, sr_info = harmonize_slice_thickness(
-                        current_image,
-                        method=self.config["super_resolution"]["method"]
-                    )
-                else:
-                    console.print("[green]Original slice thickness already reasonably isotropic[/green]")
-                    harmonized = current_image
-                    sr_info = {"method": "none", "reason": "original already isotropic"}
+                console.print(f"[cyan]Original Z-spacing: {original_spacing[2]:.2f}mm (ratio: {original_spacing[2]/original_spacing[0]:.1f}x)[/cyan]")
+                
+                # Pass original z-spacing to SR function
+                harmonized, sr_info = harmonize_slice_thickness(
+                    current_image,
+                    method=self.config["super_resolution"]["method"],
+                    original_z_spacing=original_spacing[2]
+                )
                 
                 console.print(f"[green]Method: {sr_info['method']}[/green]")
                 if "upsampling_factor" in sr_info:
@@ -186,7 +192,9 @@ class CTPreprocessor:
             except Exception as e:
                 error_msg = f"Slice harmonization failed: {str(e)}"
                 console.print(f"[red]{error_msg}[/red]")
+                console.print("[yellow]Continuing without slice harmonization...[/yellow]")
                 self.processing_info["errors"].append(error_msg)
+                # Continue with current image without harmonization
         
         # Step 4: Denoising
         if self.config["denoising"]["enabled"]:
@@ -227,7 +235,9 @@ class CTPreprocessor:
             except Exception as e:
                 error_msg = f"Denoising failed: {str(e)}"
                 console.print(f"[red]{error_msg}[/red]")
+                console.print("[yellow]Continuing without denoising...[/yellow]")
                 self.processing_info["errors"].append(error_msg)
+                # Continue with current image without denoising
         
         # Step 5: Artifact Correction
         if self.config["artifact_correction"]["enabled"]:
@@ -254,7 +264,9 @@ class CTPreprocessor:
             except Exception as e:
                 error_msg = f"Artifact correction failed: {str(e)}"
                 console.print(f"[red]{error_msg}[/red]")
+                console.print("[yellow]Continuing with uncorrected image...[/yellow]")
                 self.processing_info["errors"].append(error_msg)
+                # Continue with current image without artifact correction
         
         # Step 6: HU Calibration and Conversion
         if self.config["calibration"]["enabled"]:
@@ -265,10 +277,14 @@ class CTPreprocessor:
                 # Calibrate HU values
                 calibrated, cal_info = phantom_free_calibration(current_image)
                 
+                # Use polyenergetic model by default (can be overridden in config)
+                use_polyenergetic = self.config["calibration"].get("use_polyenergetic", True)
+                
                 # Convert to attenuation coefficients
-                mu_image, conv_info = hu_to_attenuation_coefficient(
+                mu_image, conv_info, material_id_image, density_image = hu_to_attenuation_coefficient(
                     calibrated,
-                    energy_kev=self.config["calibration"]["energy_kev"]
+                    energy_kev=self.config["calibration"].get("energy_kev", None),
+                    use_polyenergetic=use_polyenergetic
                 )
                 
                 print_calibration_report(cal_info, conv_info)
@@ -282,16 +298,26 @@ class CTPreprocessor:
                 
                 if self.config["output"]["save_intermediate"]:
                     self._save_intermediate(calibrated, output_dir / "05_calibrated")
+                    if material_id_image is not None:
+                        self._save_intermediate(material_id_image, output_dir / "06_material_ids")
+                    if density_image is not None:
+                        self._save_intermediate(density_image, output_dir / "07_densities")
                 
                 # Save both calibrated HU and mu versions
                 current_image = calibrated
                 final_mu_image = mu_image
+                
+                # Store polyenergetic data if available
+                self.material_id_image = material_id_image
+                self.density_image = density_image
                 
             except Exception as e:
                 error_msg = f"Calibration failed: {str(e)}"
                 console.print(f"[red]{error_msg}[/red]")
                 self.processing_info["errors"].append(error_msg)
                 final_mu_image = None
+                self.material_id_image = None
+                self.density_image = None
         
         # Step 7: Quality Control
         if self.config["quality_control"]["enabled"]:
@@ -305,7 +331,9 @@ class CTPreprocessor:
                     image,  # Original
                     current_image,  # Final processed
                     self.processing_info,
-                    output_path=qc_report_path
+                    output_path=qc_report_path,
+                    material_id_image=getattr(self, 'material_id_image', None),
+                    density_image=getattr(self, 'density_image', None)
                 )
                 
                 self.processing_info["timings"]["quality_control"] = time.time() - start_time
@@ -314,7 +342,9 @@ class CTPreprocessor:
             except Exception as e:
                 error_msg = f"QC generation failed: {str(e)}"
                 console.print(f"[red]{error_msg}[/red]")
+                console.print("[yellow]Continuing without QC report...[/yellow]")
                 self.processing_info["errors"].append(error_msg)
+                self.processing_info["timings"]["quality_control"] = time.time() - start_time
         
         # Save final outputs
         console.print("\n[bold]Saving Final Outputs[/bold]")
@@ -330,10 +360,39 @@ class CTPreprocessor:
             self._save_image(final_mu_image, output_path_mu)
             console.print(f"[green]Saved attenuation coefficient image: {output_path_mu}[/green]")
         
-        # Save processing info
+        # Save polyenergetic data if available
+        if hasattr(self, 'material_id_image') and self.material_id_image is not None:
+            console.print("\n[cyan]Exporting polyenergetic data for GPU processing...[/cyan]")
+            export_info = export_polyenergetic_data(
+                output_dir,
+                self.material_id_image,
+                self.density_image
+            )
+            console.print(f"[green]Exported GPU-ready polyenergetic data[/green]")
+        
+        # Save processing info - create a clean copy for JSON serialization
         info_path = output_dir / "processing_info.json"
+        
+        # Create a serializable copy of processing_info
+        serializable_info = {
+            "steps": self.processing_info.get("steps", []),
+            "timings": self.processing_info.get("timings", {}),
+            "errors": self.processing_info.get("errors", [])
+        }
+        
+        # Add other simple fields, excluding complex objects
+        for key, value in self.processing_info.items():
+            if key not in ["steps", "timings", "errors", "qc_report"]:
+                if isinstance(value, dict):
+                    # Only include simple dictionaries
+                    try:
+                        json.dumps(value)  # Test if serializable
+                        serializable_info[key] = value
+                    except:
+                        pass  # Skip non-serializable values
+        
         with open(info_path, 'w') as f:
-            json.dump(self.processing_info, f, indent=2)
+            json.dump(serializable_info, f, indent=2)
         console.print(f"[green]Saved processing info: {info_path}[/green]")
         
         # Print summary

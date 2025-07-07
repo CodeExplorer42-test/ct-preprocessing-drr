@@ -66,8 +66,9 @@ def denoise_nlm(image: sitk.Image, h: Optional[float] = None, fast_mode: bool = 
     
     # Process slice by slice for memory efficiency
     denoised = np.zeros_like(array)
-    patch_size = 5
-    patch_distance = 11 if fast_mode else 17
+    # Use smaller patch size for faster processing
+    patch_size = 3 if fast_mode else 5
+    patch_distance = 7 if fast_mode else 11
     
     with Progress(
         SpinnerColumn(),
@@ -152,8 +153,7 @@ def denoise_bilateral(image: sitk.Image, sigma_spatial: float = 3.0, sigma_range
             denoised[i] = restoration.denoise_bilateral(
                 array[i].astype(np.float32),
                 sigma_color=sigma_range,
-                sigma_spatial=sigma_spatial,
-                preserve_range=True
+                sigma_spatial=sigma_spatial
             )
             progress.update(task, advance=1)
     
@@ -190,13 +190,39 @@ def denoise_gaussian(image: sitk.Image, sigma: Optional[float] = None) -> Tuple[
     return denoised_image, info
 
 
-def denoise_adaptive(image: sitk.Image, method: str = "nlm") -> Tuple[sitk.Image, Dict]:
+def denoise_curvature_flow(image: sitk.Image, timestep: float = 0.05, iterations: int = 5) -> Tuple[sitk.Image, Dict]:
     """
-    Apply adaptive denoising based on estimated noise level.
+    Apply Curvature Flow filtering - fast edge-preserving denoising.
+    This is SimpleITK's built-in C++ implementation, much faster than bilateral.
     
     Args:
         image: Input SimpleITK image
-        method: Denoising method ("nlm", "bilateral", "gaussian")
+        timestep: Time step for the diffusion (higher = more smoothing)
+        iterations: Number of iterations (more = stronger denoising)
+        
+    Returns:
+        Tuple of (denoised image, info dict)
+    """
+    info = {
+        "method": "Curvature Flow Filter",
+        "timestep": timestep,
+        "iterations": iterations
+    }
+    
+    # CurvatureFlow is very fast and preserves edges well
+    denoised_image = sitk.CurvatureFlow(image, timeStep=timestep, numberOfIterations=iterations)
+    
+    return denoised_image, info
+
+
+def denoise_adaptive(image: sitk.Image, method: str = "auto") -> Tuple[sitk.Image, Dict]:
+    """
+    Apply adaptive denoising based on estimated noise level.
+    Optimized for speed while maintaining quality.
+    
+    Args:
+        image: Input SimpleITK image
+        method: Denoising method ("auto", "nlm", "bilateral", "gaussian", "curvature")
         
     Returns:
         Tuple of (denoised image, info dict)
@@ -206,31 +232,48 @@ def denoise_adaptive(image: sitk.Image, method: str = "nlm") -> Tuple[sitk.Image
     
     console.print(f"[cyan]Estimated noise level: {noise_level:.2f} HU[/cyan]")
     
-    # Choose parameters based on noise level
+    # Choose optimal method based on noise level
     if noise_level < 10:
-        console.print("[green]Low noise detected - applying light denoising[/green]")
-        if method == "nlm":
-            return denoise_nlm(image, h=0.6 * noise_level, fast_mode=True)
+        console.print("[green]Low noise detected - applying fast edge-preserving denoising[/green]")
+        # For low noise, use SimpleITK's fast C++ filters
+        if method == "auto" or method == "curvature":
+            # CurvatureFlow is VERY fast and preserves edges excellently
+            # Increase iterations for better quality (still fast)
+            console.print("[green]Using Curvature Flow filter for optimal speed/quality[/green]")
+            return denoise_curvature_flow(image, timestep=0.05, iterations=5)
         elif method == "bilateral":
-            return denoise_bilateral(image, sigma_spatial=2.0, sigma_range=1.5 * noise_level)
+            # Avoid slow scikit-image bilateral for large 3D volumes
+            console.print("[yellow]Using Gaussian instead of bilateral for speed[/yellow]")
+            return denoise_gaussian(image, sigma=0.3 * noise_level)
+        elif method == "nlm":
+            # NLM is too slow for real-time use
+            console.print("[yellow]Using Curvature Flow instead of NLM for speed[/yellow]")
+            return denoise_curvature_flow(image, timestep=0.05, iterations=4)
         else:
             return denoise_gaussian(image, sigma=0.3 * noise_level)
     
     elif noise_level < 20:
-        console.print("[yellow]Moderate noise detected - applying standard denoising[/yellow]")
-        if method == "nlm":
+        console.print("[yellow]Moderate noise detected - applying balanced denoising[/yellow]")
+        if method == "auto":
+            # Use CurvatureFlow with stronger parameters for better quality
+            return denoise_curvature_flow(image, timestep=0.07, iterations=7)
+        elif method == "nlm":
+            # Use smaller patch size and fast mode for better performance
             return denoise_nlm(image, h=0.8 * noise_level, fast_mode=True)
         elif method == "bilateral":
-            return denoise_bilateral(image, sigma_spatial=3.0, sigma_range=2.0 * noise_level)
+            # Use Gaussian for speed
+            return denoise_gaussian(image, sigma=0.5 * noise_level)
         else:
             return denoise_gaussian(image, sigma=0.5 * noise_level)
     
     else:
         console.print("[red]High noise detected - applying strong denoising[/red]")
-        if method == "nlm":
-            return denoise_nlm(image, h=1.0 * noise_level, fast_mode=False)
-        elif method == "bilateral":
-            return denoise_bilateral(image, sigma_spatial=5.0, sigma_range=3.0 * noise_level)
+        if method == "auto":
+            # Use CurvatureFlow with aggressive parameters
+            return denoise_curvature_flow(image, timestep=0.10, iterations=10)
+        elif method == "nlm":
+            # Even for high noise, use fast mode for reasonable performance
+            return denoise_nlm(image, h=1.0 * noise_level, fast_mode=True)
         else:
             return denoise_gaussian(image, sigma=0.7 * noise_level)
 

@@ -50,20 +50,10 @@ def resample_to_isotropic(
     resampler.SetDefaultPixelValue(default_pixel_value)
     resampler.SetInterpolator(interpolator)
     
-    # Perform resampling with optional progress bar
+    # Perform resampling (SimpleITK operations are atomic, so progress bar isn't meaningful)
     if show_progress:
-        with Progress(
-            SpinnerColumn(),
-            TextColumn("[progress.description]{task.description}"),
-            BarColumn(),
-            TimeRemainingColumn(),
-            console=console
-        ) as progress:
-            task = progress.add_task("Resampling to isotropic spacing...", total=1)
-            resampled_image = resampler.Execute(image)
-            progress.update(task, advance=1)
-    else:
-        resampled_image = resampler.Execute(image)
+        console.print("  Resampling to isotropic spacing...")
+    resampled_image = resampler.Execute(image)
     
     # Collect resampling information
     info = {

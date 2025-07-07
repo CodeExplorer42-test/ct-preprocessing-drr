@@ -191,32 +191,38 @@ def apply_ml_super_resolution(image: sitk.Image, model_path: Optional[str] = Non
     return sr_image, info
 
 
-def harmonize_slice_thickness(image: sitk.Image, method: str = "interpolation") -> Tuple[sitk.Image, Dict]:
+def harmonize_slice_thickness(image: sitk.Image, method: str = "interpolation", original_z_spacing: float = 2.5) -> Tuple[sitk.Image, Dict]:
     """
     Harmonize slice thickness using specified method.
     
     Args:
-        image: Input SimpleITK image
-        method: "interpolation" or "ml" 
+        image: Input SimpleITK image (already resampled)
+        method: "interpolation" or "ml"
+        original_z_spacing: Original z-spacing before resampling (for SR decision)
         
     Returns:
         Tuple of (harmonized image, info dict)
     """
     spacing = image.GetSpacing()
     
-    # Check if harmonization is needed
-    if spacing[2] / spacing[0] < 1.5:
-        console.print("[green]Slice thickness already reasonably isotropic[/green]")
-        return image, {"method": "none", "reason": "already isotropic"}
+    # Check if we actually need SR - if already at or below target, skip
+    if spacing[2] <= 0.5:
+        console.print(f"[green]Z-spacing already optimal ({spacing[2]:.2f}mm), skipping additional SR[/green]")
+        return image, {"method": "none", "reason": f"already at target resolution ({spacing[2]:.2f}mm)"}
     
-    console.print(f"[yellow]Z-spacing ({spacing[2]:.2f}mm) is {spacing[2]/spacing[0]:.1f}x larger than XY-spacing ({spacing[0]:.2f}mm)[/yellow]")
+    # Only apply SR if there's room for improvement
+    console.print(f"[yellow]Applying z-axis enhancement (current: {spacing[2]:.1f}mm)[/yellow]")
     
     if method == "ml":
         # Use ML-based super-resolution
         return apply_ml_super_resolution(image)
     else:
-        # Use interpolation-based method
-        target_z = min(spacing[0] * 1.5, spacing[2] / 2)  # Conservative target
+        # Only enhance if it makes sense - don't oversample
+        target_z = max(0.5, spacing[2] * 0.8)  # Target 0.5mm or 20% improvement
+        if abs(target_z - spacing[2]) < 0.05:  # Less than 0.05mm difference
+            console.print("[green]Spacing already near optimal, skipping SR[/green]")
+            return image, {"method": "none", "reason": "minimal improvement possible"}
+        
         return interpolate_thick_slices(image, target_z_spacing=target_z)
 
 

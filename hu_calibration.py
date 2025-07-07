@@ -6,6 +6,15 @@ import SimpleITK as sitk
 from scipy import ndimage
 from rich.console import Console
 from rich.table import Table
+from pathlib import Path
+
+# Import polyenergetic modules
+from material_segmentation import segment_materials_with_cleanup, print_segmentation_report
+from polyenergetic_conversion import (
+    polyenergetic_hu_to_mu, 
+    export_polyenergetic_data,
+    print_polyenergetic_report
+)
 
 console = Console()
 
@@ -153,121 +162,132 @@ def phantom_free_calibration(image: sitk.Image) -> Tuple[sitk.Image, Dict]:
 
 def hu_to_attenuation_coefficient(
     image: sitk.Image,
-    energy_kev: float = 70.0,
-    water_mu: Optional[float] = None
-) -> Tuple[sitk.Image, Dict]:
+    energy_kev: Optional[float] = None,
+    use_polyenergetic: bool = True,
+    apply_morphology: bool = True
+) -> Tuple[sitk.Image, Dict, Optional[sitk.Image], Optional[sitk.Image]]:
     """
     Convert calibrated HU values to linear attenuation coefficients.
     
     Args:
         image: Input SimpleITK image (in HU)
-        energy_kev: Effective X-ray energy in keV
-        water_mu: Linear attenuation coefficient of water at given energy
-                  (if None, uses standard value)
+        energy_kev: If specified, return μ at single energy; 
+                   otherwise use full polyenergetic model
+        use_polyenergetic: Whether to use polyenergetic model (recommended)
+        apply_morphology: Apply morphological cleanup to segmentation
         
     Returns:
-        Tuple of (mu image, conversion info)
+        Tuple of (mu_image, conversion_info, material_id_image, density_image)
+        For backward compatibility, last two are None if not using polyenergetic
     """
-    # Standard linear attenuation coefficients at different energies (cm^-1)
-    # From NIST tables
-    water_mu_table = {
-        40: 0.2683,
-        50: 0.2269,
-        60: 0.2059,
-        70: 0.1928,
-        80: 0.1837,
-        90: 0.1771,
-        100: 0.1720,
-        120: 0.1620
-    }
+    if not use_polyenergetic:
+        # Legacy monoenergetic model (NOT RECOMMENDED)
+        console.print("[yellow]Warning: Using monoenergetic model - expect errors up to 155 HU for bone![/yellow]")
+        
+        # Standard water μ at 70 keV
+        water_mu = 0.1928
+        if energy_kev is None:
+            energy_kev = 70.0
+        
+        # Simple HU to μ conversion
+        array = sitk.GetArrayFromImage(image)
+        mu_array = water_mu * (array / 1000.0 + 1.0)
+        mu_array[mu_array < 0] = 0.0001
+        
+        mu_image = sitk.GetImageFromArray(mu_array.astype(np.float32))
+        mu_image.CopyInformation(image)
+        
+        info = {
+            "method": "monoenergetic",
+            "energy_kev": energy_kev,
+            "water_mu": water_mu,
+            "warning": "Monoenergetic model - expect large errors for bone"
+        }
+        
+        return mu_image, info, None, None
     
-    # Get water mu for given energy (interpolate if needed)
-    if water_mu is None:
-        if energy_kev in water_mu_table:
-            water_mu = water_mu_table[energy_kev]
-        else:
-            # Linear interpolation
-            energies = sorted(water_mu_table.keys())
-            for i in range(len(energies) - 1):
-                if energies[i] <= energy_kev <= energies[i + 1]:
-                    e1, e2 = energies[i], energies[i + 1]
-                    mu1, mu2 = water_mu_table[e1], water_mu_table[e2]
-                    water_mu = mu1 + (mu2 - mu1) * (energy_kev - e1) / (e2 - e1)
-                    break
-            else:
-                # Default to 70 keV if out of range
-                water_mu = water_mu_table[70]
+    # Polyenergetic model (RECOMMENDED)
+    console.print("[green]Using physics-accurate polyenergetic model[/green]")
     
-    # Convert HU to linear attenuation coefficient
-    # μ = μ_water * (HU/1000 + 1)
-    array = sitk.GetArrayFromImage(image)
-    mu_array = water_mu * (array / 1000.0 + 1.0)
+    # Step 1: Material segmentation
+    material_id_image, density_image, seg_info = segment_materials_with_cleanup(
+        image, apply_morphology=apply_morphology
+    )
     
-    # Set negative values (air) to small positive value
-    mu_array[mu_array < 0] = 0.0001
+    # Step 2: Polyenergetic conversion
+    mu_image, conv_info = polyenergetic_hu_to_mu(
+        image, material_id_image, density_image, energy_kev
+    )
     
-    # Create output image
-    mu_image = sitk.GetImageFromArray(mu_array.astype(np.float32))
-    mu_image.CopyInformation(image)
-    
-    # Calculate statistics
+    # Combine info
     info = {
-        "energy_kev": energy_kev,
-        "water_mu": water_mu,
-        "mu_min": float(np.min(mu_array)),
-        "mu_max": float(np.max(mu_array)),
-        "mu_mean": float(np.mean(mu_array)),
-        "mu_air": float(np.mean(mu_array[array < -900])) if np.any(array < -900) else None,
-        "mu_water": water_mu,
-        "mu_bone": float(np.mean(mu_array[array > 500])) if np.any(array > 500) else None
+        "method": "polyenergetic",
+        "segmentation": seg_info,
+        "conversion": conv_info
     }
     
-    return mu_image, info
+    return mu_image, info, material_id_image, density_image
 
 
 def print_calibration_report(calibration_info: Dict, conversion_info: Dict) -> None:
     """Print formatted calibration and conversion report."""
     console.print("\n[bold cyan]HU Calibration Report[/bold cyan]")
     
-    if calibration_info["method"] != "none":
+    if calibration_info.get("method") != "none":
         table = Table(title="Calibration Results")
         table.add_column("Parameter", style="cyan")
         table.add_column("Value", style="green")
         
-        table.add_row("Method", calibration_info["method"])
-        table.add_row("Scale Factor", f"{calibration_info['scale_factor']:.4f}")
-        table.add_row("Offset", f"{calibration_info['offset']:.2f} HU")
-        table.add_row("Calibration Error", f"{calibration_info['calibration_error']:.2f} HU")
+        table.add_row("Method", calibration_info.get("method", "unknown"))
+        if "scale_factor" in calibration_info:
+            table.add_row("Scale Factor", f"{calibration_info['scale_factor']:.4f}")
+            table.add_row("Offset", f"{calibration_info['offset']:.2f} HU")
+            table.add_row("Calibration Error", f"{calibration_info['calibration_error']:.2f} HU")
         
         console.print(table)
         
         # Reference tissue measurements
-        ref_table = Table(title="Reference Tissue Measurements")
-        ref_table.add_column("Tissue", style="cyan")
-        ref_table.add_column("Measured HU", style="yellow")
-        ref_table.add_column("Expected HU", style="green")
-        
-        expected = {"air": -1000, "fat": -100}
-        for tissue, measured in calibration_info["measured_values"].items():
-            ref_table.add_row(tissue.capitalize(), f"{measured:.1f}", f"{expected[tissue]}")
-        
-        console.print(ref_table)
+        if "measured_values" in calibration_info:
+            ref_table = Table(title="Reference Tissue Measurements")
+            ref_table.add_column("Tissue", style="cyan")
+            ref_table.add_column("Measured HU", style="yellow")
+            ref_table.add_column("Expected HU", style="green")
+            
+            expected = {"air": -1000, "fat": -100}
+            for tissue, measured in calibration_info["measured_values"].items():
+                ref_table.add_row(tissue.capitalize(), f"{measured:.1f}", f"{expected[tissue]}")
+            
+            console.print(ref_table)
     
-    # Attenuation coefficient conversion
-    console.print("\n[bold cyan]Attenuation Coefficient Conversion[/bold cyan]")
-    
-    mu_table = Table()
-    mu_table.add_column("Tissue", style="cyan")
-    mu_table.add_column("μ (cm⁻¹)", style="green")
-    
-    if conversion_info["mu_air"] is not None:
-        mu_table.add_row("Air", f"{conversion_info['mu_air']:.4f}")
-    mu_table.add_row("Water", f"{conversion_info['mu_water']:.4f}")
-    if conversion_info["mu_bone"] is not None:
-        mu_table.add_row("Bone", f"{conversion_info['mu_bone']:.4f}")
-    
-    console.print(mu_table)
-    console.print(f"\nEnergy: [yellow]{conversion_info['energy_kev']} keV[/yellow]")
+    # Handle both old monoenergetic and new polyenergetic formats
+    if isinstance(conversion_info, dict):
+        if "method" in conversion_info and conversion_info["method"] == "polyenergetic":
+            # New polyenergetic format
+            if "segmentation" in conversion_info:
+                print_segmentation_report(conversion_info["segmentation"])
+            if "conversion" in conversion_info:
+                print_polyenergetic_report(conversion_info["conversion"])
+        else:
+            # Old monoenergetic format
+            console.print("\n[bold cyan]Attenuation Coefficient Conversion[/bold cyan]")
+            
+            mu_table = Table()
+            mu_table.add_column("Tissue", style="cyan")
+            mu_table.add_column("μ (cm⁻¹)", style="green")
+            
+            if conversion_info.get("mu_air") is not None:
+                mu_table.add_row("Air", f"{conversion_info['mu_air']:.4f}")
+            if "mu_water" in conversion_info:
+                mu_table.add_row("Water", f"{conversion_info['mu_water']:.4f}")
+            if conversion_info.get("mu_bone") is not None:
+                mu_table.add_row("Bone", f"{conversion_info['mu_bone']:.4f}")
+            
+            console.print(mu_table)
+            if "energy_kev" in conversion_info:
+                console.print(f"\nEnergy: [yellow]{conversion_info['energy_kev']} keV[/yellow]")
+            
+            if "warning" in conversion_info:
+                console.print(f"\n[red]Warning: {conversion_info['warning']}[/red]")
 
 
 if __name__ == "__main__":
@@ -285,14 +305,39 @@ if __name__ == "__main__":
         console.print("\n[bold]Performing Phantom-Free HU Calibration[/bold]")
         calibrated, cal_info = phantom_free_calibration(image)
         
-        # Convert to attenuation coefficients
-        console.print("\n[bold]Converting to Linear Attenuation Coefficients[/bold]")
-        mu_image, conv_info = hu_to_attenuation_coefficient(calibrated, energy_kev=70.0)
+        # Test both mono and polyenergetic models for comparison
+        console.print("\n[bold]Testing Monoenergetic Model (Legacy)[/bold]")
+        mu_mono, info_mono, _, _ = hu_to_attenuation_coefficient(
+            calibrated, energy_kev=70.0, use_polyenergetic=False
+        )
         
-        # Print report
-        print_calibration_report(cal_info, conv_info)
+        console.print("\n[bold]Testing Polyenergetic Model (Recommended)[/bold]")
+        mu_poly, info_poly, mat_ids, densities = hu_to_attenuation_coefficient(
+            calibrated, use_polyenergetic=True
+        )
         
-        # Save a sample slice for visualization
+        # Print reports
+        console.print("\n[bold]===== MONOENERGETIC RESULTS =====[/bold]")
+        print_calibration_report(cal_info, info_mono)
+        
+        console.print("\n[bold]===== POLYENERGETIC RESULTS =====[/bold]")
+        print_calibration_report(cal_info, info_poly)
+        
+        # Save outputs
+        output_dir = Path("test_output_polyenergetic")
+        output_dir.mkdir(exist_ok=True)
+        
+        # Save polyenergetic data for GPU processing
+        if mat_ids is not None and densities is not None:
+            export_info = export_polyenergetic_data(
+                output_dir, mat_ids, densities
+            )
+            console.print(f"\n[green]Exported GPU-ready data to {output_dir}/[/green]")
+            console.print(f"  - Material IDs: material_ids.nii.gz")
+            console.print(f"  - Densities: densities.nii.gz")
+            console.print(f"  - Lookup tables: polyenergetic_data.npz")
+            console.print(f"  - Metadata: polyenergetic_metadata.json")
+        
         console.print("\n[green]Calibration and conversion complete![/green]")
     else:
         console.print("[red]DICOM directory not found![/red]")
